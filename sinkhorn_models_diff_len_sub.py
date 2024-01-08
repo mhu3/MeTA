@@ -17,11 +17,26 @@ import torch.nn.functional as F
 from inspect import isfunction
 from functools import partial, wraps, reduce
 
-# from local_attention import LocalAttention
+from local_attention import LocalAttention
 from product_key_memory import PKM
 from reversible import ReversibleSequence, SequentialSequence, ModifiedSequentialSequence
 
 # helper functions
+
+def pad_sequences(sequences, padding_value=0.0):
+    """
+    Pads a list of sequences to the maximum length of the longest sequence.
+    """
+    max_len = max([seq.size(0) for seq in sequences])
+    num_dim = sequences[0].size(1)
+
+    padded_seqs = torch.full((len(sequences), max_len, num_dim), padding_value)
+    
+    for i, seq in enumerate(sequences):
+        end = seq.size(0)
+        padded_seqs[i, :end, :] = seq
+
+    return padded_seqs
 
 def identity(x, *args, **kwargs): return x
 
@@ -84,6 +99,11 @@ def split_at_index(dim, index, t):
     l = (*pre_slices, slice(None, index))
     r = (*pre_slices, slice(index, None))
     return t[l], t[r]
+
+def bucket(buckets, t, dim=1):
+    shape = list(t.shape)
+    shape[dim:dim+1] = [buckets, -1]
+    return t.reshape(*shape)
 
 def segment_sequence_based_on_speed(x, num_buckets=40, speed_threshold=30):
     bucket_lengths = []
@@ -163,7 +183,8 @@ def custom_bucket(input_tensor, bucket_size):
 
             all_buckets.append(head_buckets)  # Append directly to all_buckets
 
-    return all_buckets  # This will be a list of shape [batch_size * num_heads, num_buckets, bucket_size, dim]
+
+    return all_buckets
 
 def sample_gumbel(shape, device, dtype, eps=1e-6):
     u = torch.empty(shape, device=device, dtype=dtype).uniform_(0, 1)
@@ -391,7 +412,6 @@ class SinkhornAttention(nn.Module):
         self.non_permutative = non_permutative
         self.sinkhorn_iter = sinkhorn_iter
         self.n_sortcut = n_sortcut
-        self.to_out = nn.Linear(2*dim_heads, dim_heads)
 
         if use_simple_sort_net:
             self.sort_net = SimpleSortNet(heads, max_seq_len, dim_heads * 2, non_permutative=non_permutative, temperature=temperature, sinkhorn_iter=sinkhorn_iter)
@@ -401,9 +421,21 @@ class SinkhornAttention(nn.Module):
         self.n_top_buckets = n_top_buckets
         self.dropout = nn.Dropout(dropout)
 
+    def attention_calculation(self, b_q_i, b_k_j, b_v_j, R_ij):
+        d_k = b_k_j.shape[-1]
+        # Dot-product attention
+        attention_score = torch.einsum('ie,je->ij', b_q_i, b_k_j) * (d_k ** -0.5)
+        
+        attention_weights = torch.softmax(attention_score, dim=-1)
+
+        attention_matrix = torch.einsum('ij,je->ie', attention_weights, b_v_j)
+
+        output = attention_matrix * R_ij
+
+        return output
+
     def forward(self, q, k, v, bucket_size, q_mask=None, kv_mask=None):
         b, h, t, d_h = q.shape
-        n_top = self.n_top_buckets
         bh = b * h
 
         merge_batch_head = partial(merge_dims, 0, 1)
@@ -413,161 +445,69 @@ class SinkhornAttention(nn.Module):
         b_k = custom_bucket(k, bucket_size)
         b_v = custom_bucket(v, bucket_size)
 
-        num_buckets = len(bucket_size[0])
-
-        def pad_buckets_according_to_max_in_current_bucket(b_q, b_k, b_v, d_h):
-            num_buckets = len(b_q[0])
-            
-            # 1. For each bucket index across all samples in the batch, compute the maximum length.
-            max_lengths_per_bucket = [max(len(sample[i]) for sample in b_q) for i in range(num_buckets)]
-            
-            # Helper function to pad a list of tensors according to a max length
-            def pad_bucket(bucket, max_len, d_h):
-                # Get current lengths of all tensors in bucket
-                lengths = [tensor.size(0) for tensor in bucket]
-                # print(f"Original lengths in bucket: {lengths}")
-                
-                # Compute the number of zeros needed for each tensor to reach max_len
-                padding_lengths = [max_len - length for length in lengths]
-                
-                # Create the padded bucket
-                padded_bucket = [torch.cat([tensor, torch.zeros(pad_len, d_h, device=tensor.device)], dim=0) for tensor, pad_len in zip(bucket, padding_lengths)]
-                
-                # Stack the tensors in the padded bucket along the 0th dimension
-                stacked_bucket = torch.stack(padded_bucket, dim=0)
-                
-                return stacked_bucket, lengths
-
-            # For each bucket, pad tensors to max length of that bucket
-            b_q_padded, lengths_q = zip(*[pad_bucket([sample[i] for sample in b_q], max_lengths_per_bucket[i], d_h) for i in range(num_buckets)])
-            # print(f"Original lengths for q: {lengths_q}")
-            b_k_padded, lengths_k = zip(*[pad_bucket([sample[i] for sample in b_k], max_lengths_per_bucket[i], d_h) for i in range(num_buckets)])
-            b_v_padded, lengths_v = zip(*[pad_bucket([sample[i] for sample in b_v], max_lengths_per_bucket[i], d_h) for i in range(num_buckets)])
-            
-            # Compute the masks once the tensors are padded
-            masks_q = [[torch.cat([torch.ones(length, device=tensor.device), torch.zeros(max_len - length, device=tensor.device)], dim=0) for tensor, length, max_len in zip(bucket, bucket_lengths, [max_lengths_per_bucket[i]]*len(bucket))] for i, (bucket, bucket_lengths) in enumerate(zip(b_q_padded, lengths_q))]
-            masks_k = [[torch.cat([torch.ones(length, device=tensor.device), torch.zeros(max_len - length, device=tensor.device)], dim=0) for tensor, length, max_len in zip(bucket, bucket_lengths, [max_lengths_per_bucket[i]]*len(bucket))] for i, (bucket, bucket_lengths) in enumerate(zip(b_k_padded, lengths_k))]
-            masks_v = [[torch.cat([torch.ones(length, device=tensor.device), torch.zeros(max_len - length, device=tensor.device)], dim=0) for tensor, length, max_len in zip(bucket, bucket_lengths, [max_lengths_per_bucket[i]]*len(bucket))] for i, (bucket, bucket_lengths) in enumerate(zip(b_v_padded, lengths_v))]
-            
-            return b_q_padded, masks_q, b_k_padded, masks_k, b_v_padded, masks_v, lengths_q
-
-        b_q_pad_list, masks_q_list, b_k_pad_list, masks_k_list, b_v_pad_list, masks_v_list, lengths_q_list = pad_buckets_according_to_max_in_current_bucket(b_q, b_k, b_v, d_h)
-        
-        # print("b_q_pad_list.shape", len(b_q_pad_list))
-        # print("b_q_pad_list[0].shape", len(b_q_pad_list[0]))
-        # print("b_q_pad_list[0][0].shape", b_q_pad_list[0][0].shape)
-
-        masks_q_tensor_list = [torch.stack(masks_q, dim=0) for masks_q in masks_q_list]
-        masks_k_tensor_list = [torch.stack(masks_k, dim=0) for masks_k in masks_k_list]
-
         R = self.sort_net(q, k, bucket_size)
-        # print("R shape: ", R.shape)
-        R = R.type_as(q).to(q)
+        R = R.type_as(q).to(q.device)
 
         all_attention_matrices = []
-        all_local_attention_matrices = []
 
-        # Loop through each bucket in b_q
-        for i, b_q_i in enumerate(b_q_pad_list):
-            R_values = R[:, i, :]
-            concatenated_attention_matrices = []
-            # Local attention: attention within the same bucket
-            mask_q_i = masks_q_tensor_list[i]
-            mask_k_j = masks_k_tensor_list[i]  # For local attention, k and q are from the same bucket
-            mask_combined = mask_q_i.unsqueeze(-1) * mask_k_j.unsqueeze(-2)
-            local_attention_score = torch.einsum('bie,bje->bij', b_q_i, b_k_pad_list[i]) * (d_h ** -0.5)
-            local_attention_score = local_attention_score.masked_fill(mask_combined == 0, -1e9)
-            local_attention_weights = torch.softmax(local_attention_score, dim=-1)
-            local_attention_matrix = torch.einsum('bij,bje->bie', local_attention_weights, b_v_pad_list[i])
-            local_masked_output = local_attention_matrix * mask_q_i.unsqueeze(-1).type_as(local_attention_matrix)
-            all_local_attention_matrices.append(local_masked_output)
+        # Loop through each batch*head
+        for idx in range(bh):
+            # Slicing tensors for the specific batch and head
+            b_q_sample = b_q[idx]
+            b_k_sample = b_k[idx]
+            b_v_sample = b_v[idx]
 
-            # Loop through each bucket in b_k and b_v
-            for j, b_k_j in enumerate(b_k_pad_list):
-                mask_k_j = masks_k_tensor_list[j]
-                # Check if the corresponding R value is 0, first dimension is batch size, second dimension is number of buckets, third dimension is number of buckets
-                # if R_values[:, j].sum() == 0:
-                if R_values[:, j].sum() < 1:
-                    continue
-                else:
+            summed_attention_matrices = []
+
+            # Inside the double loop for 'i' and 'j'
+            for i, b_q_i in enumerate(b_q_sample):
+
+                attention_matrices_sample = []
+
+                for j, b_k_j in enumerate(b_k_sample):
+
+                    # Concatenate the local and the current b_k together
+                    concatenated_b_k = torch.cat((b_k_sample[i], b_k_sample[j]), dim=0)
+                    concatenated_b_v = torch.cat((b_v_sample[i], b_v_sample[j]), dim=0)
+
+                    # # Skip the local attention part, it's already included as the first element
+                    # if j == i:
+                    #     continue
                     
-                    mask_combined = mask_q_i.unsqueeze(-1) * mask_k_j.unsqueeze(-2)               
-                    # Calculate the attention matrix
-                    attention_score = torch.einsum('bie,bje->bij', b_q_i, b_k_j) * (d_h ** -0.5)
-                    # print("attention weights shape: ", attention_weights.shape)
-                    attention_score = attention_score.masked_fill(mask_combined == 0, -1e9)
-                    attention_weights = torch.softmax(attention_score, dim=-1)
-                    
-                    # Calculate attention matrix
-                    attention_matrix = torch.einsum('bij,bje->bie', attention_weights, b_v_pad_list[j])
-                    # print("attention matrix shape: ", attention_matrix.shape)
+                    R_ij = R[idx, i, j]
 
-                    attention_matrix *= R_values[:, j][:, None, None] # Element-wise multiply by R[i, j]
-                    # print("attention matrix shape after R multiplication: ", attention_matrix.shape)
-                    concatenated_attention_matrices.append(attention_matrix)
+                    if R_ij <= 0.001:
+                        # Append a zero tensor of appropriate shape to maintain consistent shape
+                        attention_matrices_sample.append(torch.zeros_like(b_q_i))
+                    else:
+                        # Perform attention calculation
+                        attention_matrices_sample.append(
+                            self.attention_calculation(b_q_i, concatenated_b_k, concatenated_b_v, R_ij)
+                            # self.attention_calculation(b_q_i, b_k_j, b_v_sample[j], R_ij)
+                        )
 
-            # Convert the list of attention matrices to a single tensor
-            concatenated_attention_matrix_tensor = torch.stack(concatenated_attention_matrices, dim=1)
-            final_attention_matrix = torch.sum(concatenated_attention_matrix_tensor, dim=1)
-            masked_output = final_attention_matrix * masks_q_tensor_list[i].unsqueeze(-1).type_as(final_attention_matrix)
-            all_attention_matrices.append(masked_output)
+                # Check that attention_matrices_sample is not empty before stacking
+                if attention_matrices_sample:
+                    global_attention_matrix = torch.stack(attention_matrices_sample).sum(dim=0)
+                    combined_attention_matrix = global_attention_matrix
+                    summed_attention_matrices.append(combined_attention_matrix)
 
-        # combined_matrices = []
+            # Concatenate to represent that head
+            all_attention_matrices.append(
+                torch.cat(summed_attention_matrices, dim=0)
+            )
 
-        # for all_attention, local_attention, unpadded_len in zip(all_attention_matrices, all_local_attention_matrices, lengths_q_list):
-        #     output = all_attention + local_attention
-        #     # output = torch.cat((all_attention, local_attention), dim=1)
-    
-        #     actual_len = unpadded_len[0]
-        #     print("actual_len", actual_len)
-        #     print("output.shape", output.shape[1])
-            
-        #     # If the output exceeds the unpadded length, trim it
-        #     if output.shape[1] > actual_len:
-        #         combined_matrices.append(output[:, :actual_len, :])
-        #     else:
-        #         combined_matrices.append(output)
-        # print("combined_matrices.shape", len(combined_matrices))
-        # print("combined_matrices[0].shape", combined_matrices[0].shape)
-        # print("combined_matrices[0][0].shape", combined_matrices[0][0].shape)
+        # Stack to get the final output
+        outputs = torch.stack(all_attention_matrices)
 
-        all_m = []
-        local_m = []
+        # Reshape
+        outputs = outputs.reshape(b, h, t, d_h)
 
-        for all_attention, local_attention, unpadded_len in zip(all_attention_matrices, all_local_attention_matrices, lengths_q_list):
-            actual_len = unpadded_len[0]
-            
-            if all_attention.shape[1] > actual_len:
-                all_m.append(all_attention[:, :actual_len, :])
-            else:
-                all_m.append(all_attention)
-                
-            if local_attention.shape[1] > actual_len:
-                local_m.append(local_attention[:, :actual_len, :])
-            else:
-                local_m.append(local_attention)
+        return outputs
 
-        all_output = torch.cat(all_m, dim=1)
-        local_output = torch.cat(local_m, dim=1)
-
-        all_output = all_output.reshape(b, h, t, d_h)
-        local_output = local_output.reshape(b, h, t, d_h)
-
-        # # outputs = torch.cat((all_output, local_output), dim=3)
-
-        # # outputs = self.to_out(outputs)
-        # # Use the learnable weight to combine all_output and local_output
-        # weight = torch.nn.Parameter(torch.randn(1)).to(all_output.device)  # Ensure weight is on the same device as all_output
-        # outputs = weight * all_output + (1 - weight) * local_output
-
-        # # # outputs = torch.cat(combined_matrices, dim=1)
-        # # # outputs = outputs[:, :t, :] 
-        # # print("outputs.shape", outputs.shape)
-        # # outputs = outputs.reshape(b, h, t, d_h)
-        # # print("outputs.shape", outputs.shape)
-
-        return all_output, local_output
-
+def apply_fn_after_split_ind(dim, ind, fn, t):
+    l, r = split_at_index(dim, ind, t)
+    return torch.cat((l, fn(r)), dim=dim)
 
 class SinkhornSelfAttention(nn.Module):
     def __init__(self, dim, max_seq_len, local_window_size=8, heads = 8, dim_head = None, kv_bucket_size = None, non_permutative = True, sinkhorn_iter = 5, n_sortcut = 0, temperature = 0.75, attn_dropout = 0., dropout = 0., context_only = False, use_simple_sort_net = False, n_local_attn_heads = 0, n_top_buckets = 1):
@@ -586,26 +526,21 @@ class SinkhornSelfAttention(nn.Module):
 
         self.to_out = nn.Linear(dim_heads, dim)
 
-        # self.n_local_attn_heads = n_local_attn_heads
-        # self.local_attention = LocalAttention(local_window_size, dropout = attn_dropout, look_forward=1)
+        self.n_local_attn_heads = n_local_attn_heads
+        self.local_attention = LocalAttention(local_window_size, dropout = attn_dropout, look_forward=1)
 
         sink_heads = heads - n_local_attn_heads
 
         attn = SinkhornAttention(dim, dim_head, sink_heads, max_seq_len, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = n_sortcut, temperature = temperature, dropout = attn_dropout, kv_bucket_size = kv_bucket_size, use_simple_sort_net = use_simple_sort_net, n_top_buckets = n_top_buckets)
+
         self.sinkhorn_attention = attn
-        
-        # global_atten, local_atten = SinkhornAttention(dim, dim_head, sink_heads, max_seq_len, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = n_sortcut, temperature = temperature, dropout = attn_dropout, kv_bucket_size = kv_bucket_size, use_simple_sort_net = use_simple_sort_net, n_top_buckets = n_top_buckets)
-        # self.sinkhorn_attention = global_atten
-        # self.local_attention = local_atten
-        sinkhorn_attention_instance = SinkhornAttention(dim, dim_head, sink_heads, max_seq_len, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = n_sortcut, temperature = temperature, dropout = attn_dropout, kv_bucket_size = kv_bucket_size, use_simple_sort_net = use_simple_sort_net, n_top_buckets = n_top_buckets)
-        self.attention = sinkhorn_attention_instance
+
         self.dropout = nn.Dropout(dropout)
     
     
     def forward(self, x, bucket_size, input_mask = None, context = None, context_mask = None):
 
-        # b, t, d, h, dh, l_h = *x.shape, self.heads, self.dim_head, self.n_local_attn_heads
-        b, t, d, h, dh, l_h = *x.shape, self.heads*2, self.dim_head, self.heads
+        b, t, d, h, dh, l_h = *x.shape, self.heads, self.dim_head, self.n_local_attn_heads
         assert not (self.context_only and context is None), 'context key / values must be supplied if context self attention layer'
         assert not (context is not None and (context.shape[0], context.shape[2]) !=  (b, d)), 'contextual key / values must have the same batch and dimensions as the decoder'
 
@@ -617,75 +552,39 @@ class SinkhornSelfAttention(nn.Module):
         qkv = (q, *kv)
         merge_heads_fn = partial(merge_heads, h)
         q, k, v = map(merge_heads_fn, qkv)
-        # print("q.shape", q.shape, "k.shape", k.shape, "v.shape", v.shape)
- 
+
         split_index_fn = partial(split_at_index, 1, l_h)
         (lq, q), (lk, k), (lv, v) = map(split_index_fn, (q, k, v))
-        # print("lq.shape", lq.shape)
-        # print("q.shape", q.shape)
-
         has_local, has_sinkhorn = map(lambda x: x.shape[1] > 0, (lq, q))
-        # print("has_local", has_local)
-        # print("has_sinkhorn", has_sinkhorn)
 
-        global_attention, local_attention = self.attention(q, k, v, bucket_size, q_mask = input_mask, kv_mask = kv_mask)
         out = []
-        out.append(global_attention)
-        # print("out.shape", len(out))
-        # print("out[0].shape", out[0].shape)
-        out.append(local_attention)
-        # print("out.shape", len(out))
-        # print("out[0].shape", out[0].shape)
 
-        
-        # if has_local > 0:
-        #     out.append(self.local_attention(lq, lk, lv, input_mask = input_mask))
+        if has_local > 0:
+            out.append(self.local_attention(lq, lk, lv, input_mask = input_mask))
 
-        # if has_sinkhorn > 0:
-        #     out.append(self.sinkhorn_attention(q, k, v, q_mask = input_mask, kv_mask = kv_mask, bucket_size=bucket_size))
-        # print("out.shape1", len(out))
-        # print("out[0].shape", out[0].shape)
+        if has_sinkhorn > 0:
+            out.append(self.sinkhorn_attention(q, k, v, q_mask = input_mask, kv_mask = kv_mask, bucket_size=bucket_size))
+
         out = torch.cat(out, dim=1)
         out = split_heads(h, out)
         out = self.to_out(out)
         out = self.dropout(out)
         
         return out
-    
+
 class SinkhornSelfAttentionBlock(nn.Module):
     def __init__(self, dim, depth, max_seq_len = None, local_window_size = 8, heads = 8, dim_head = None, bucket_size = 64, kv_bucket_size = None, context_bucket_size = None, non_permutative = False, sinkhorn_iter = 5, n_sortcut = 0, temperature = 0.75, reversible = False, ff_chunks = 1, ff_dropout = 0., attn_dropout = 0., attn_layer_dropout = 0., layer_dropout = 0., weight_tie = False, ff_glu = False, use_simple_sort_net = None, receives_context = False, context_n_sortcut = 2, n_local_attn_heads = 0, use_rezero = False, n_top_buckets = 1,  pkm_layers = tuple(), pkm_num_keys = 128):
-        super(SinkhornSelfAttentionBlock, self).__init__()
-    #     self.embed_dim = dim
-    #     self.num_heads = heads
-
-    #     self.attention = SinkhornSelfAttention(dim, max_seq_len, local_window_size = local_window_size, heads = heads, dim_head = dim_head, kv_bucket_size = kv_bucket_size, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = n_sortcut, temperature = temperature, attn_dropout = attn_dropout, dropout = attn_layer_dropout, use_simple_sort_net = use_simple_sort_net, n_local_attn_heads = n_local_attn_heads, n_top_buckets = n_top_buckets)
-    #     self.dropout = nn.Dropout(attn_dropout)
-    #     self.layer_norm = nn.LayerNorm(dim)
-
-    #     self.feed_forward = nn.Sequential(
-    #         nn.Linear(dim, 4 * dim),
-    #         nn.ReLU(),
-    #         nn.Linear(4 * dim,dim),
-    #         nn.Dropout(attn_dropout)
-    #     )
-
-    # def forward(self, x, bucket_size, mask = None):
-    #     batch_size, seq_len, embed_dim = x.size()
-    #     attention_output = self.attention(x, bucket_size, input_mask = mask)  
-    #     x = self.layer_norm(x + self.dropout(attention_output))
-    #     ff_output = self.feed_forward(x)
-    #     x = self.layer_norm(x + self.dropout(ff_output))
-    #     return x
+        super().__init__()
         layers = nn.ModuleList([])
 
         kv_bucket_size = default(kv_bucket_size, bucket_size)
         context_bucket_size = default(context_bucket_size, bucket_size)
 
-        get_attn = lambda: SinkhornSelfAttention(dim, bucket_size, max_seq_len,  heads = heads, dim_head = dim_head, kv_bucket_size = kv_bucket_size, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = n_sortcut, temperature = temperature, attn_dropout = attn_dropout, dropout = attn_layer_dropout, use_simple_sort_net = use_simple_sort_net, n_local_attn_heads = n_local_attn_heads, n_top_buckets = n_top_buckets)
+        get_attn = lambda: SinkhornSelfAttention(dim, max_seq_len, local_window_size = local_window_size, heads = heads, dim_head = dim_head, kv_bucket_size = kv_bucket_size, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = n_sortcut, temperature = temperature, attn_dropout = attn_dropout, dropout = attn_layer_dropout, use_simple_sort_net = use_simple_sort_net, n_local_attn_heads = n_local_attn_heads, n_top_buckets = n_top_buckets)
         get_ff = lambda: Chunk(ff_chunks, FeedForward(dim, dropout = ff_dropout, glu = ff_glu), along_dim=1)
         get_pkm = lambda: PKM(dim, num_keys = pkm_num_keys)
 
-        get_attn_context = lambda: SinkhornSelfAttention(dim, bucket_size, max_seq_len, context_only = True, heads = heads, dim_head = dim_head, kv_bucket_size = context_bucket_size, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = context_n_sortcut, temperature = temperature, attn_dropout = attn_dropout, dropout = attn_layer_dropout, n_top_buckets = n_top_buckets)
+        get_attn_context = lambda: SinkhornSelfAttention(dim, max_seq_len, context_only = True, heads = heads, dim_head = dim_head, kv_bucket_size = context_bucket_size, non_permutative = non_permutative, sinkhorn_iter = sinkhorn_iter, n_sortcut = context_n_sortcut, temperature = temperature, attn_dropout = attn_dropout, dropout = attn_layer_dropout, n_top_buckets = n_top_buckets)
         get_ff_context = lambda: FeedForward(dim, dropout = ff_dropout, glu = ff_glu)
 
         if weight_tie:
@@ -712,7 +611,7 @@ class SinkhornSelfAttentionBlock(nn.Module):
                 fn_wrapper(get_ff_context())
             ]))
 
-        execute_type = ReversibleSequence if reversible else SequentialSequence
+        execute_type = ReversibleSequence if reversible else ModifiedSequentialSequence
 
         attn_context_layer = ((True, False),) if receives_context else tuple()
         route_attn = ((True, False), *attn_context_layer) * depth
@@ -725,18 +624,13 @@ class SinkhornSelfAttentionBlock(nn.Module):
         self.receives_context = receives_context
 
         self.max_seq_len = max_seq_len
-        self.pad_to_bucket_size = lcm(bucket_size, kv_bucket_size)
         self.context_bucket_size = context_bucket_size
 
-        self.is_fixed_length = use_simple_sort_net
-        # if not using attention sort and also not causal, force fixed sequence length
-        assert not (self.is_fixed_length and self.max_seq_len is None), 'maximum sequence length must be specified if length is fixed'
-
-    def forward(self, x, bucket_size, **kwargs):
-        assert not (self.is_fixed_length and x.shape[1] != self.max_seq_len), f'you must supply a sequence of length {self.max_seq_len}'
-        assert ('context' not in kwargs or self.receives_context), 'needs to be initted with receives_context True if passing contextual key / values'
-        out = self.layers(x, bucket_size, **kwargs)
+    def forward(self, x, bucket_size):
+        out = self.layers(x, bucket_size)
+        # print("out shape: ", out.shape)
         return out
+
 
 class SinkhornTransformer(nn.Module):
     def __init__(self, sub_len, num_tokens, dim, depth, local_window_size = 8, heads = 8, dim_head = None, num_buckets = 40, kv_bucket_size = None, context_bucket_size = None, causal = False, non_permutative = True, sinkhorn_iter = 5, n_sortcut = 0, temperature = 0.75, reversible = False, ff_chunks = 1, ff_glu = False, return_embeddings = False, ff_dropout = 0., attn_dropout = 0., attn_layer_dropout = 0., layer_dropout = 0., emb_dropout = 0., weight_tie = False, emb_dim = None, use_simple_sort_net = None, receives_context = False, context_n_sortcut = 0, n_local_attn_heads = 0, use_rezero = False, n_top_buckets = 2, pkm_layers = tuple(), pkm_num_keys = 128):
@@ -782,8 +676,8 @@ class SinkhornTransformer(nn.Module):
         bucket_size_2 = segment_sequence_based_on_speed(x2, num_buckets=self.num_buckets)
 
         x1 = self.to_token_emb(x1)
-        x2 = self.to_token_emb(x2)     
-            
+        x2 = self.to_token_emb(x2)
+
         x1 = self.sinkhorn_transformer(x1, bucket_size=bucket_size_1)
         x2 = self.sinkhorn_transformer(x2, bucket_size=bucket_size_2)
 
@@ -847,3 +741,4 @@ class SinkhornViTBinaryClassifier(nn.Module):
     def forward(self, x):
         prediction = self.model(x)
         return prediction
+
